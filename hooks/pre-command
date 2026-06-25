@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLUGIN_PREFIX="BUILDKITE_PLUGIN_DEPLOY_TAROT"
+
+plugin_config() {
+  local name="$1"
+  local default_value="${2:-}"
+  local var
+  local vars=(
+    "${PLUGIN_PREFIX}_${name}"
+    "BUILDKITE_PLUGIN_BK_DEPLOY_TAROT_${name}"
+    "BK_DEPLOY_TAROT_${name}"
+  )
+
+  for var in "${vars[@]}"; do
+    if [[ -n "${!var-}" ]]; then
+      printf '%s' "${!var}"
+      return
+    fi
+  done
+
+  printf '%s' "$default_value"
+}
+
+truthy() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|y|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "+++ Deploy Tarot configuration error"
+    echo "Missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+urlencode() {
+  python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+infer_role() {
+  local configured
+  configured="$(plugin_config ROLE "")"
+  if [[ -n "$configured" ]]; then
+    printf '%s\n' "$configured"
+    return
+  fi
+
+  local actor="${BUILDKITE_BUILD_CREATOR:-${BUILDKITE_BUILD_AUTHOR:-${BUILDKITE_BUILD_AUTHOR_NAME:-}}}"
+  local actor_lower
+  actor_lower="$(printf '%s' "$actor" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ "$actor_lower" == *bot* || "$actor_lower" == *"[bot]"* || "$actor_lower" == "buildkite" ]]; then
+    printf 'ai-agent\n'
+  else
+    printf 'devops\n'
+  fi
+}
+
+infer_intent() {
+  local configured
+  configured="$(plugin_config INTENT "")"
+  if [[ -n "$configured" ]]; then
+    printf '%s\n' "$configured"
+    return
+  fi
+
+  local source="${BUILDKITE_SOURCE:-}"
+  local branch="${BUILDKITE_BRANCH:-}"
+  local branch_lower
+  branch_lower="$(printf '%s' "$branch" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ -n "${BUILDKITE_TAG:-}" ]]; then
+    printf 'full-release\n'
+    return
+  fi
+
+  case "$source" in
+    schedule) printf 'dependency-update\n'; return ;;
+    ui|trigger_job) printf 'just-vibes\n'; return ;;
+  esac
+
+  if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]]; then
+    case "$branch_lower" in
+      dependabot/*|renovate/*) printf 'dependency-update\n' ;;
+      fix/*|hotfix/*) printf 'hotfix-prod\n' ;;
+      feat/*|feature/*) printf 'new-feature\n' ;;
+      refactor/*|chore/*) printf 'refactor\n' ;;
+      db/*|migration/*) printf 'db-migration\n' ;;
+      infra/*|ops/*) printf 'infra-change\n' ;;
+      docs/*) printf 'public-doc-release\n' ;;
+      security/*) printf 'security-patch\n' ;;
+      *) printf 'quick-fix\n' ;;
+    esac
+    return
+  fi
+
+  case "$branch_lower" in
+    main|master) printf 'full-release\n' ;;
+    dependabot/*|renovate/*) printf 'dependency-update\n' ;;
+    fix/*|hotfix/*) printf 'hotfix-prod\n' ;;
+    feat/*|feature/*) printf 'new-feature\n' ;;
+    refactor/*|chore/*) printf 'refactor\n' ;;
+    db/*|migration/*) printf 'db-migration\n' ;;
+    infra/*|ops/*) printf 'infra-change\n' ;;
+    docs/*) printf 'public-doc-release\n' ;;
+    security/*) printf 'security-patch\n' ;;
+    *) printf 'quick-fix\n' ;;
+  esac
+}
+
+draw_reading() {
+  local api_url="$1"
+  local role="$2"
+  local intent="$3"
+  local timeout="$4"
+  local retries="$5"
+  local response_file="$6"
+  local headers_file="$7"
+  local request_url
+  request_url="${api_url}?role=$(urlencode "$role")&intent=$(urlencode "$intent")"
+
+  local http_code
+  if ! http_code="$(curl -sS \
+    --retry "$retries" \
+    --connect-timeout "$timeout" \
+    --max-time "$timeout" \
+    -D "$headers_file" \
+    -o "$response_file" \
+    -w '%{http_code}' \
+    "$request_url")"; then
+    echo "+++ Deploy Tarot request failed"
+    echo "Could not reach Deploy Tarot at $api_url" >&2
+    return 1
+  fi
+
+  if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+    echo "+++ Deploy Tarot request failed"
+    echo "Deploy Tarot returned HTTP $http_code" >&2
+    if [[ "$http_code" == "429" ]]; then
+      awk 'BEGIN{IGNORECASE=1} /^Retry-After:/ {gsub("\r", "", $0); print}' "$headers_file" >&2 || true
+    fi
+    cat "$response_file" >&2 || true
+    return 1
+  fi
+}
+
+render_reading() {
+  local response_file="$1"
+  RENDER_IMAGES="$(plugin_config RENDER_IMAGES true)" \
+  IMAGE_BASE_URL="$(plugin_config IMAGE_BASE_URL https://deploytarot.com/static/cards)" \
+  python3 - "$response_file" <<'PY'
+import base64
+import json
+import os
+import re
+import sys
+import urllib.request
+
+MAJOR_ARCANA = {
+    "The Fool": "00_the_fool.webp",
+    "The Magician": "01_the_magician.webp",
+    "The High Priestess": "02_the_high_priestess.webp",
+    "The Empress": "03_the_empress.webp",
+    "The Emperor": "04_the_emperor.webp",
+    "The Hierophant": "05_the_hierophant.webp",
+    "The Lovers": "06_the_lovers.webp",
+    "The Chariot": "07_the_chariot.webp",
+    "Strength": "08_strength.webp",
+    "The Hermit": "09_the_hermit.webp",
+    "Wheel of Fortune": "10_wheel_of_fortune.webp",
+    "Justice": "11_justice.webp",
+    "The Hanged Man": "12_the_hanged_man.webp",
+    "Death": "13_death.webp",
+    "Temperance": "14_temperance.webp",
+    "The Devil": "15_the_devil.webp",
+    "The Tower": "16_the_tower.webp",
+    "The Star": "17_the_star.webp",
+    "The Moon": "18_the_moon.webp",
+    "The Sun": "19_the_sun.webp",
+    "Judgement": "20_judgement.webp",
+    "The World": "21_the_world.webp",
+}
+
+def truthy(value):
+    return str(value).lower() in {"1", "true", "yes", "y", "on"}
+
+def escape_ansi_param(value):
+    return str(value).replace("'", "").replace(";", ",")
+
+def inline_image(url, alt):
+    print(f"\033]1338;url='{escape_ansi_param(url)}';alt='{escape_ansi_param(alt)}'\a")
+
+def inline_link(url, content):
+    print(f"\033]1339;url='{escape_ansi_param(url)}';content='{escape_ansi_param(content)}'\a")
+
+def inline_buildkite_image(source_url, filename, alt):
+    if os.environ.get("BUILDKITE") != "true":
+        inline_image(source_url, alt)
+        return
+
+    try:
+        with urllib.request.urlopen(source_url, timeout=15) as response:
+            image = base64.b64encode(response.read()).decode("ascii")
+    except Exception as error:
+        print(f"Could not download {filename} for inline rendering: {error}", file=sys.stderr)
+        inline_image(source_url, alt)
+        return
+
+    name = base64.b64encode(filename.encode("utf-8")).decode("ascii")
+    print(f"\033]1337;File=inline=1;name={name};alt='{escape_ansi_param(alt)}':{image}\a")
+
+def wrap(text, width=96):
+    words = re.split(r"\s+", str(text).strip())
+    lines = []
+    current = ""
+    for word in words:
+        if not word:
+            continue
+        candidate = f"{current} {word}".strip()
+        if len(candidate) > width and current:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return "\n".join(lines)
+
+with open(sys.argv[1], encoding="utf-8") as response:
+    reading = json.load(response)
+
+render_images = truthy(os.environ.get("RENDER_IMAGES", "true"))
+image_base_url = os.environ.get("IMAGE_BASE_URL", "https://deploytarot.com/static/cards").rstrip("/")
+
+print("--- ☽ Deploy Tarot ☾")
+print(f"Role: {reading.get('role', 'unknown')}")
+print(f"Intent: {reading.get('intent', 'unknown')}")
+print(f"Verdict: {reading.get('verdict_label', reading.get('verdict', 'unknown'))}")
+print()
+print(wrap(reading.get("verdict_text", "")))
+
+for card in reading.get("cards", []):
+    name = card.get("name", "Unknown card")
+    orientation = "reversed" if card.get("reversed") else "upright"
+    position = card.get("position_label", card.get("position", "Card"))
+    print()
+    print(f"✦ {position}: {name} ({orientation})")
+    filename = MAJOR_ARCANA.get(name)
+    if render_images and filename:
+        source_url = f"{image_base_url}/{filename}"
+        inline_buildkite_image(source_url, filename, f"{name} ({orientation})")
+    elif render_images:
+        print(f"No image mapping found for {name}.")
+    print(wrap(card.get("narrative", "")))
+
+share_url = reading.get("share_url")
+if share_url:
+    print()
+    inline_link(share_url, "Open Deploy Tarot reading")
+    print(f"Share URL: {share_url}")
+PY
+}
+
+json_value() {
+  python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2], ""))' "$1" "$2"
+}
+
+set_buildkite_metadata() {
+  local response_file="$1"
+  if ! command -v buildkite-agent >/dev/null 2>&1; then
+    return 0
+  fi
+
+  buildkite-agent meta-data set deploy-tarot:verdict "$(json_value "$response_file" verdict)" >/dev/null 2>&1 || return 0
+  buildkite-agent meta-data set deploy-tarot:verdict-label "$(json_value "$response_file" verdict_label)" >/dev/null 2>&1 || return 0
+  buildkite-agent meta-data set deploy-tarot:share-url "$(json_value "$response_file" share_url)" >/dev/null 2>&1 || return 0
+}
+
+main() {
+  require_command curl
+  require_command python3
+
+  local role intent api_url timeout retries fail_on_abort
+  role="$(infer_role)"
+  intent="$(infer_intent)"
+  api_url="$(plugin_config API_URL https://deploytarot.com/api/reading)"
+  timeout="$(plugin_config TIMEOUT 15)"
+  retries="$(plugin_config RETRIES 2)"
+  fail_on_abort="$(plugin_config FAIL_ON_ABORT false)"
+
+  local response_file headers_file
+  response_file="$(mktemp)"
+  headers_file="$(mktemp)"
+  trap "rm -f '$response_file' '$headers_file'" EXIT
+
+  draw_reading "$api_url" "$role" "$intent" "$timeout" "$retries" "$response_file" "$headers_file"
+  render_reading "$response_file"
+  if truthy "$(plugin_config STORE_METADATA false)"; then
+    set_buildkite_metadata "$response_file"
+  fi
+
+  if truthy "$fail_on_abort" && [[ "$(json_value "$response_file" verdict)" == "abort-mission" ]]; then
+    echo "Deploy Tarot returned abort-mission and fail_on_abort is enabled." >&2
+    exit 1
+  fi
+}
+
+main "$@"

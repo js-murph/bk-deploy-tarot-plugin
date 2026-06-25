@@ -1,0 +1,109 @@
+name: Deploy Tarot
+description: Draws a Deploy Tarot reading before your Buildkite step runs and renders the cards in the build log.
+author: https://github.com/rembish
+requirements:
+  - bash
+  - curl
+  - python3
+configuration:
+  properties:
+    role:
+      type: string
+      description: Your deployment role. Defaults to devops unless a bot-like build author is detected.
+      enum:
+        - business-analyst
+        - ceo
+        - ciso
+        - cto
+        - cleaning-lady
+        - client
+        - consultant
+        - contractor
+        - dba
+        - data-scientist
+        - designer
+        - devops
+        - doc-writer
+        - eng-manager
+        - hr
+        - intern
+        - junior-dev
+        - offshore-dev
+        - product-manager
+        - project-manager
+        - qa
+        - receptionist
+        - sales
+        - scrum-master
+        - security
+        - senior-dev
+        - shadow-it
+        - sre
+        - stakeholder
+        - system-analyst
+        - tech-lead
+        - vp-eng
+        - ai-agent
+        - rubber-duck
+        - tarot-reader
+    intent:
+      type: string
+      description: What you are deploying. Defaults to a best-effort inference from Buildkite branch, tag, source, and pull request environment.
+      enum:
+        - ab-test
+        - ai-integration
+        - api-release
+        - auth-rewrite
+        - config-change
+        - db-migration
+        - dependency-update
+        - deprecation
+        - feature-flag
+        - full-release
+        - gdpr-compliance
+        - hotfix-prod
+        - infra-change
+        - ipo
+        - just-vibes
+        - mobile-release
+        - new-feature
+        - open-source
+        - performance
+        - public-doc-release
+        - quick-fix
+        - rebranding
+        - redesign
+        - refactor
+        - rollback
+        - security-patch
+        - seo-optimization
+        - sunset
+    fail_on_abort:
+      type: boolean
+      description: Exit non-zero when the oracle returns abort-mission.
+      default: false
+    render_images:
+      type: boolean
+      description: Render card art in Buildkite log output using ANSI image escapes.
+      default: true
+    store_metadata:
+      type: boolean
+      description: Store verdict details in Buildkite metadata for downstream steps.
+      default: false
+    api_url:
+      type: string
+      description: Deploy Tarot API URL.
+      default: https://deploytarot.com/api/reading
+    image_base_url:
+      type: string
+      description: Base URL used when downloading Deploy Tarot card images for inline rendering.
+      default: https://deploytarot.com/static/cards
+    timeout:
+      type: integer
+      description: Curl connect and request timeout in seconds.
+      default: 15
+    retries:
+      type: integer
+      description: Number of curl retries for transient failures.
+      default: 2
+  additionalProperties: false
